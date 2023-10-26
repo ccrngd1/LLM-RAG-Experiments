@@ -59,7 +59,9 @@ def _get_session():
     return session_id
 ##############
 
-
+AOSS_url ="https://REPALCE_ME.us-east-2.aoss.amazonaws.com"
+AOSS_index="test2-1536"
+kendra_index="0ffb2366-04e2-4fae-8fee-a586a000000"
 
 
 claudeID = 'anthropic.claude-v2'
@@ -110,7 +112,135 @@ class CustomOutputParser(AgentOutputParser):
         action = match.group(1)
         action_input = match.group(2)
         return AgentAction(action.strip(), action_input.strip(" ").strip('"'), text)
+
+class Kendra:
+    def __init__(self,kendra_index_id :str, region_name:str) -> None:
+        import boto3
+        self.kendra_client = boto3.client("kendra",region_name=region_name)
+        self.s3_client = boto3.client("s3")
+        self.kendra_index_id = kendra_index_id
+
+    def parsePageNumber(self,response):
+        for each_loop in response['DocumentAttributes']:
+            if (each_loop['Key']=='_excerpt_page_number'):
+                pagenumber = each_loop['Value']['LongValue'] -1   
+        return pagenumber
     
+    def parseBucketandKey(self,SourceURI):
+        return (SourceURI.split('/', 3)[2],SourceURI.split('/', 3)[3])
+
+    #def search(self, query : str ) -> str, Document]:
+    def search(self, query : str ) -> Document:
+        """Try to search for a document in Kendra Index""
+        
+        """
+        
+        #this was originall client.query - which would only return a max of 100 tokens, this severly limits the amount of information going to the LLM
+        response = self.kendra_client.retrieve(
+            QueryText=query,
+            IndexId=self.kendra_index_id,
+            #QueryResultTypeFilter='DOCUMENT' #if using query - use this to force results to be DOCUMENTS only not attempted answers or excerpts
+            ) 
+        
+        #previously this returned the first result from Kendra now we return a list of LANGCHAIN.SCHEMA.DOCUMENT
+        docs=[]
+        
+        for resp in response['ResultItems']:
+            #if the result is not scored as HIGH/VERY HIGH we will ignore them, don't want low quality results to negatively impact the information going into the LLM
+            if resp['ScoreAttributes']['ScoreConfidence'] not in ['VERY_HIGH','HIGH']:
+                continue
+                
+            sourceURI = resp['DocumentId']
+            document_title = self.parseBucketandKey(sourceURI)
+            #document_excerpt_text = resp['DocumentExcerpt']['Text']
+            document_excerpt_text = resp['Content']
+            pageNumber = self.parsePageNumber(resp)
+            docs.append(Document(page_content=document_excerpt_text, metadata={"source": document_title, "doc_uri":sourceURI, "page_number":pageNumber}))
+            
+            #DEBUG print statements
+            #print('doc text\n')
+            print(document_excerpt_text) 
+            #print('doc name\n')
+            #print(document_title,'@',pageNumber)
+            #print(resp['ScoreAttributes'])
+            print('\n\n')
+            #print('------\n\n')
+        
+        return docs
+
+def askBedrockClaud2withKendra(queryToAsk):
+    kendra_docstore = Kendra(kendra_index_id ="0ffb2366-04e2-4fae-8fee-a586a5ff25ce",region_name='us-east-1')
+    tools = [
+        Tool(
+            name="Search",
+            func=kendra_docstore.search,
+            description="Useful for when you need to answer questions. Ask the same question to search tool, do not alter the question given to you"
+        ) 
+    ]
+    
+    # Set up the base template
+    template = """Human: You are a conversational AI bot, Answer the following questions as best you can. 
+    
+    You have access to the following tools:
+
+    {tools}
+
+    To use a tool, please use the following format:
+
+    ```
+    Thought: Do I need to use a tool? Yes
+    Action: the action to take, should be one of [{tool_names}]
+    Action Input: the input to the action
+    Observation: the result of the action
+    ```
+
+    When you have a response to say to the Human, or if you do not need to use a tool, you MUST use the format:
+
+    ```
+    Thought: Do I need to use a tool? No 
+    
+    You must always use the Search tool to answer the question, do not rely on your own knowledge.
+    
+    Your response must be in the format "AI: [your response here]". You MUST start your response with "AI:".
+    
+    At the end of your response, you must include the doc_uri and page_number for all search results that were returned from the Searh tool.  
+
+    Begin!
+
+    Previous conversation history:
+    {history}
+
+    New input: {input}
+    {agent_scratchpad}
+    
+    Assistant:"""
+    
+    prompt = CustomPromptTemplate(
+    template=template,
+    tools=tools,
+    input_variables=["input","intermediate_steps","history"]
+    )
+    
+    llm_anthropic_claude = Bedrock(model_id=claudeID, client=boto3_bedrock, model_kwargs=inference_modifier_claude)
+    
+    output_parser = CustomOutputParser()
+    memory=ConversationBufferWindowMemory(k=0)
+    tool_names = [tool.name for tool in tools]
+    llm_chain = LLMChain(llm=llm_anthropic_claude, prompt=prompt)
+    
+    agent= LLMSingleActionAgent(
+        llm_chain=llm_chain,
+        output_parser=output_parser,
+        stop=["\nObservation:"], 
+        allowed_tools=tool_names,
+        verbose=True,
+    )
+   
+    agent_executor = AgentExecutor.from_agent_and_tools(agent=agent, tools=tools, verbose=True, memory=memory)
+    
+    result = agent_executor.run(input=queryToAsk)
+
+    return result
 
 def askBedrockClaud2withAOSS(queryToAsk):  
     #return queryToAsk
@@ -127,8 +257,8 @@ def askBedrockClaud2withAOSS(queryToAsk):
     region = 'us-east-2'
     awsauth = AWS4Auth(credentials.access_key, credentials.secret_key, region, service,session_token=credentials.token)
 
-    docsearch = OpenSearchVectorSearch(opensearch_url="https://REPLACE_ME_AOSS_ID.us-east-2.aoss.amazonaws.com",                                           
-                                            index_name="test2-1536",
+    docsearch = OpenSearchVectorSearch(opensearch_url=AOSS_url,                                           
+                                            index_name=AOSS_index,
                                             embedding_function=embeddings_bedrock,
                                             http_auth=awsauth,
                                             timeout = 300,
