@@ -1,0 +1,11 @@
+botocore
+boto3
+pandas 
+Pillow 
+streamlit  
+langchain
+pydantic
+pypdf
+faiss-cpu
+requests_aws4auth
+opensearch-py
